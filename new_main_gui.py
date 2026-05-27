@@ -121,6 +121,44 @@ class GitHubPushThread(QThread):
                 self.log_signal.emit(f"선택된 {len(self.items)}개의 매물을 매일 자동 실행하도록 예약합니다...")
                 gh.create_scheduled_file(self.items)
                 gh.push_to_github(self.items)
+
+                # ★ data/scheduled_properties.json을 GitHub에 push (Actions push 트리거용)
+                self.log_signal.emit("[INFO] 예약 파일을 GitHub에 업로드 중...")
+                try:
+                    scheduled_file = os.path.join("data", "scheduled_properties.json")
+                    if os.path.exists(scheduled_file):
+                        # git add
+                        r = subprocess.run(
+                            ["git", "add", scheduled_file],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace"
+                        )
+                        if r.returncode != 0:
+                            self.log_signal.emit(f"[WARN] git add 실패: {r.stderr.strip()}")
+                        else:
+                            # git commit
+                            from datetime import datetime
+                            commit_msg = f"Scheduled {len(self.items)} properties ({datetime.now().strftime('%Y-%m-%d %H:%M')})"
+                            r2 = subprocess.run(
+                                ["git", "commit", "-m", commit_msg],
+                                capture_output=True, text=True, encoding="utf-8", errors="replace"
+                            )
+                            if r2.returncode != 0 and "nothing to commit" not in r2.stdout:
+                                self.log_signal.emit(f"[WARN] git commit 실패: {r2.stderr.strip()}")
+                            else:
+                                # git push
+                                r3 = subprocess.run(
+                                    ["git", "push"],
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace"
+                                )
+                                if r3.returncode == 0:
+                                    self.log_signal.emit("[OK] 예약 파일 GitHub 업로드 완료 → 자동화 워크플로우가 시작됩니다!")
+                                else:
+                                    self.log_signal.emit(f"[WARN] git push 실패: {r3.stderr.strip()}")
+                    else:
+                        self.log_signal.emit(f"[WARN] 예약 파일을 찾을 수 없습니다: {scheduled_file}")
+                except Exception as e2:
+                    self.log_signal.emit(f"[WARN] 예약 파일 push 중 오류: {e2}")
+
                 self.log_signal.emit("자동화 예약 설정이 클라우드 서버에 안전하게 등록되었습니다!")
 
             elif self.action == "cancel":
