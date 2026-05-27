@@ -1,0 +1,457 @@
+# .github/workflows/property-automation.yml
+# 다중 매물 처리용 메인 자동화 워크플로우
+
+name: Property Automation
+
+# Git Push 및 Issue 생성 권한 추가
+permissions:
+  contents: write
+
+on:
+  # 17시 55분 KST 자동 실행 (임시 테스트)
+  schedule:
+    - cron: '55 8 * * *'  # UTC 08:55 = KST 17:55
+
+  push:
+    paths:
+      - 'data/scheduled_properties.json'
+
+  # 수동 실행 (테스트용)
+  workflow_dispatch:
+    inputs:
+      property_numbers:
+        description: '매물번호들 (콤마로 구분, 선택사항)'
+        required: false
+        default: ''
+      test_mode:
+        description: '테스트 모드'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+        - 'true'
+        - 'false'
+
+jobs:
+  check-schedule:
+    runs-on: ubuntu-latest
+    outputs:
+      has_schedule: ${{ steps.check.outputs.has_schedule }}
+      property_count: ${{ steps.check.outputs.property_count }}
+      properties: ${{ steps.check.outputs.properties }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Check for scheduled properties
+      id: check
+      run: |
+        if [ -f "data/scheduled_properties.json" ]; then
+          echo "has_schedule=true" >> $GITHUB_OUTPUT
+          
+          # JSON에서 매물 정보 추출
+          properties=$(cat data/scheduled_properties.json | jq -r '.properties | join(",")')
+          count=$(cat data/scheduled_properties.json | jq -r '.total_count')
+          
+          echo "properties=${properties}" >> $GITHUB_OUTPUT
+          echo "property_count=${count}" >> $GITHUB_OUTPUT
+          
+          echo "📋 예약된 매물 발견: ${count}개"
+          echo "📊 매물번호: ${properties}"
+        else
+          echo "has_schedule=false" >> $GITHUB_OUTPUT
+          echo "📝 예약된 매물 없음"
+        fi
+
+  automation:
+    needs: check-schedule
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright/python:v1.55.0-noble
+    if: needs.check-schedule.outputs.has_schedule == 'true' || github.event.inputs.property_numbers != ''
+    outputs:
+      has_failures: ${{ steps.automation_run.outputs.has_failures }}
+      failed_properties: ${{ steps.automation_run.outputs.failed_properties }}
+      success_count: ${{ steps.automation_run.outputs.success_count }}
+      total_count: ${{ steps.automation_run.outputs.total_count }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install playwright==1.55.0
+        echo "✅ Playwright 패키지 설치 완료 (브라우저와 시스템 의존성은 컨테이너에 사전 설치됨)"
+    
+    - name: Determine property numbers
+      id: properties
+      run: |
+        if [ -n "${{ github.event.inputs.property_numbers }}" ]; then
+          # 수동 입력된 매물번호 사용
+          echo "properties=${{ github.event.inputs.property_numbers }}" >> $GITHUB_OUTPUT
+          echo "source=manual" >> $GITHUB_OUTPUT
+        else
+          # 예약 파일에서 매물번호 사용
+          echo "properties=${{ needs.check-schedule.outputs.properties }}" >> $GITHUB_OUTPUT
+          echo "source=scheduled" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Run multi-property automation
+      id: automation_run
+      run: |
+        echo "🚀 다중 매물 자동화 시작..."
+        echo "📋 처리할 매물: ${{ steps.properties.outputs.properties }}"
+        echo "📊 매물 개수: $(echo '${{ steps.properties.outputs.properties }}' | tr ',' '\n' | wc -l)"
+        echo "🔧 테스트 모드: ${{ github.event.inputs.test_mode || 'false' }}"
+
+        # Python 스크립트 실행 - 출력을 파일로만 저장 (콘솔 출력 안 함)
+        set +e
+        python multi_property_automation.py > automation.log 2>&1
+        exit_code=$?
+        set -e
+
+        echo "script_exit_code=${exit_code}" >> $GITHUB_OUTPUT
+
+        # 로그 출력 (Python에서 이미 *** 완전 마스킹 처리됨)
+        if [ -f automation.log ]; then
+          echo "--- automation.log ---"
+          cat automation.log
+        fi
+
+        # 로그인 실패 감지
+        if grep -q "❌ 로그인 실패로 자동화 중단" automation.log; then
+          echo "has_login_failure=true" >> $GITHUB_OUTPUT
+          echo "::error::로그인 실패로 자동화 중단됨"
+          exit 1
+        fi
+
+        # 시스템 오류 감지 (exit code가 0이 아닌 경우)
+        if [ ${exit_code} -ne 0 ]; then
+          echo "has_system_error=true" >> $GITHUB_OUTPUT
+          echo "::error::Python 스크립트 실행 실패 (exit code: ${exit_code})"
+          exit 1
+        fi
+
+        # 실패한 매물 추출
+        if grep -q "❌ 최종 실패:" automation.log; then
+          failed_properties=$(grep "❌ 최종 실패:" automation.log | sed 's/.*: //')
+          echo "failed_properties=${failed_properties}" >> $GITHUB_OUTPUT
+          echo "has_failures=true" >> $GITHUB_OUTPUT
+        else
+          echo "has_failures=false" >> $GITHUB_OUTPUT
+        fi
+
+        # 성공/실패 카운트 추출
+        if grep -q "✅ 최종 성공:" automation.log; then
+          success_count=$(grep "✅ 최종 성공:" automation.log | sed 's/.*: //;s/\/.*//')
+          total_count=$(grep "✅ 최종 성공:" automation.log | sed 's/.*\///;s/개//')
+          echo "success_count=${success_count}" >> $GITHUB_OUTPUT
+          echo "total_count=${total_count}" >> $GITHUB_OUTPUT
+        fi
+      env:
+        LOGIN_ID: ${{ secrets.LOGIN_ID }}
+        LOGIN_PASSWORD: ${{ secrets.LOGIN_PASSWORD }}
+        PROPERTY_NUMBERS: ${{ steps.properties.outputs.properties }}
+        TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
+        TZ: Asia/Seoul
+    
+    - name: Delete completed schedule
+      if: always() && steps.properties.outputs.source == 'scheduled'
+      run: |
+        if [ -f "data/scheduled_properties.json" ]; then
+          rm data/scheduled_properties.json
+          echo "🗑️ 예약 파일 삭제 완료: scheduled_properties.json"
+        else
+          echo "📝 삭제할 예약 파일이 없습니다."
+        fi
+
+    - name: Create execution log
+      if: always()
+      run: |
+        timestamp=$(date +"%Y%m%d_%H%M%S")
+        mkdir -p results
+        
+        cat > results/execution_${timestamp}.json << EOF
+        {
+          "executed_at": "$(date -Iseconds)",
+          "properties": "${{ steps.properties.outputs.properties }}",
+          "property_count": $(echo '${{ steps.properties.outputs.properties }}' | tr ',' '\n' | wc -l),
+          "test_mode": "${{ github.event.inputs.test_mode || 'false' }}",
+          "source": "${{ steps.properties.outputs.source }}",
+          "status": "completed"
+        }
+        EOF
+        
+        echo "📝 실행 로그 생성: results/execution_${timestamp}.json"
+    
+    - name: Commit results
+      if: always()
+      run: |
+        # Docker 컨테이너에서 Git 리포지토리 인식 (동적 경로 사용)
+        git config --global --add safe.directory $GITHUB_WORKSPACE
+        git config --global user.email "action@github.com"
+        git config --global user.name "GitHub Action"
+
+        # 변경사항 확인
+        git status
+
+        # Pull 먼저 수행 (conflict 방지)
+        git pull --rebase || true
+
+        # 스테이징
+        git add results/ data/ || true
+
+        # 커밋 (변경사항이 있을 때만)
+        if git diff --staged --quiet; then
+          echo "📝 변경사항 없음 - 커밋 건너뜀"
+        else
+          git commit -m "🤖 자동화 실행 완료 $(date +"%Y-%m-%d %H:%M:%S")"
+          echo "✅ 커밋 완료"
+
+          # Push (최대 3회 재시도)
+          for i in 1 2 3; do
+            if git push; then
+              echo "✅ Push 성공 (시도 $i)"
+              break
+            else
+              echo "⚠️ Push 실패 (시도 $i) - 재시도..."
+              sleep 2
+              git pull --rebase || true
+            fi
+          done
+        fi
+    
+    - name: Upload screenshots
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: automation-screenshots-${{ github.run_number }}
+        path: "*.png"
+        retention-days: 7
+    
+    - name: Upload logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: automation-logs-${{ github.run_number }}
+        path: |
+          *.log
+          results/
+        retention-days: 30
+
+    - name: Check automation result and notify
+      if: always()
+      run: |
+        echo "📊 자동화 실행 결과:"
+
+        # 빈 값 처리
+        total="${{ steps.automation_run.outputs.total_count }}"
+        success="${{ steps.automation_run.outputs.success_count }}"
+
+        if [ -z "$total" ]; then total=0; fi
+        if [ -z "$success" ]; then success=0; fi
+
+        echo "- 전체: ${total}개"
+        echo "- 성공: ${success}개"
+
+        # 실패 개수 계산
+        failed=$((total - success))
+        echo "- 실패: ${failed}개"
+
+        # 실패 감지: 1개라도 실패하면 경고 출력 (automation job은 이미 실패 처리됨)
+        if [ "${{ steps.automation_run.outputs.has_failures }}" = "true" ]; then
+          echo ""
+          echo "::warning::⚠️ 일부 매물 처리 실패"
+          echo "::warning::실패한 매물 번호: ${{ steps.automation_run.outputs.failed_properties }}"
+          echo "::warning::처리 결과: ${success}/${total}개 성공"
+        elif [ ${total} -gt 0 ] && [ ${success} -eq ${total} ]; then
+          echo "✅ 모든 매물 처리 성공!"
+        fi
+
+    - name: Prepare email body
+      if: always() && steps.automation_run.outputs.has_failures == 'true'
+      run: |
+        cat > email_body.txt << EOF
+        매물광고 자동화 처리 결과
+        ========================
+        
+        실행 시간: $(date +"%Y-%m-%d %H:%M:%S")
+        성공: ${{ steps.automation_run.outputs.success_count }}개
+        실패: ${{ steps.automation_run.outputs.total_count }}개 중 일부
+        
+        실패 매물 상세:
+        EOF
+        
+        if [ -f "email_report_unmasked.txt" ]; then
+          cat email_report_unmasked.txt >> email_body.txt
+        else
+          echo "상세 정보 없음" >> email_body.txt
+        fi
+        
+        cat >> email_body.txt << EOF
+        
+        상세 로그: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        EOF
+
+    - name: Send email on property failures
+      if: always() && steps.automation_run.outputs.has_failures == 'true'
+      uses: dawidd6/action-send-mail@v3
+      with:
+        server_address: smtp.gmail.com
+        server_port: 465
+        secure: true
+        username: ${{ secrets.NOTIFY_EMAIL }}
+        password: ${{ secrets.NOTIFY_EMAIL_PASSWORD }}
+        subject: "⚠️ 매물 처리 실패 (${{ steps.automation_run.outputs.success_count }}/${{ steps.automation_run.outputs.total_count }}개 성공) - ${{ github.repository }}"
+        to: ${{ secrets.NOTIFY_EMAIL }}
+        from: ${{ secrets.NOTIFY_EMAIL }}
+        body: file://email_body.txt
+
+    - name: Calculate failure count
+      id: calc_failures
+      if: always()
+      run: |
+        total=${{ steps.automation_run.outputs.total_count }}
+        success=${{ steps.automation_run.outputs.success_count }}
+
+        # 빈 값 처리
+        if [ -z "$total" ]; then total=0; fi
+        if [ -z "$success" ]; then success=0; fi
+
+        failed=$((total - success))
+        echo "failed_count=${failed}" >> $GITHUB_OUTPUT
+        echo "실패 개수: ${failed}개"
+
+  no-schedule:
+    needs: check-schedule
+    runs-on: ubuntu-latest
+    if: needs.check-schedule.outputs.has_schedule == 'false' && github.event.inputs.property_numbers == ''
+
+    steps:
+    - name: No automation needed
+      run: |
+        echo "ℹ️ 실행할 자동화 작업이 없습니다."
+        echo ""
+        echo "📋 예약된 매물: 없음"
+        echo "📝 수동 입력: 없음"
+        echo ""
+        echo "💡 매물을 예약하려면:"
+        echo "1. PC GUI에서 매물 선택"
+        echo "2. GitHub에 scheduled_properties.json 업로드"
+        echo "3. 다음 자정에 자동 실행됨"
+
+  # 모든 오류 감지 및 알림 (매물 실패 + 시스템 오류)
+  final-check:
+    needs: [check-schedule, automation]
+    runs-on: ubuntu-latest
+    if: always() && (needs.check-schedule.outputs.has_schedule == 'true' || github.event.inputs.property_numbers != '')
+
+    steps:
+    - name: Check workflow status
+      id: workflow_status
+      run: |
+        echo "📊 최종 상태 확인"
+        echo ""
+        echo "🔍 Automation Job 상태: ${{ needs.automation.result }}"
+        echo ""
+
+        # automation job 실패 확인 (로그인 실패, 시스템 오류 등)
+        if [ "${{ needs.automation.result }}" == "failure" ]; then
+          echo "::error::❌ 자동화 실행 실패!"
+          echo ""
+
+          # 로그에서 실패 원인 파악
+          echo "📋 감지된 오류 유형:"
+
+          # 로그인 실패 여부 확인 (automation job에서 설정)
+          echo "  - 로그인 실패 여부: 확인 필요"
+          echo "  - 시스템 오류 여부: 확인 필요"
+          echo ""
+
+          echo "🔍 상세 로그: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "has_system_error=true" >> $GITHUB_OUTPUT
+
+          # failure_reason 추출 시도
+          echo "failure_reason=시스템 오류 또는 로그인 실패" >> $GITHUB_OUTPUT
+          exit 1
+
+        elif [ "${{ needs.automation.result }}" == "cancelled" ]; then
+          echo "::error::⚠️ 자동화 실행이 취소되었습니다."
+          echo "has_system_error=true" >> $GITHUB_OUTPUT
+          echo "failure_reason=실행 취소됨" >> $GITHUB_OUTPUT
+          exit 1
+
+        elif [ "${{ needs.automation.result }}" == "skipped" ]; then
+          echo "::warning::⏭️ 자동화 실행이 건너뛰어졌습니다."
+          echo "failure_reason=실행 건너뜀" >> $GITHUB_OUTPUT
+
+        else
+          # automation job 성공 시에도 매물 실패 체크
+          if [ "${{ needs.automation.outputs.has_failures }}" == "true" ]; then
+            echo "has_property_failures=true" >> $GITHUB_OUTPUT
+            echo "::warning::⚠️ 일부 매물 처리 실패 (자동화는 정상 실행됨)"
+          else
+            echo "✅ 자동화 정상 완료 (모든 매물 처리 성공)"
+          fi
+        fi
+
+    - name: Download automation logs
+      if: failure() && steps.workflow_status.outputs.has_system_error == 'true'
+      uses: actions/download-artifact@v4
+      continue-on-error: true
+      with:
+        name: automation-logs-${{ github.run_number }}
+        path: ./logs
+
+    - name: Extract failure reason from logs
+      if: failure() && steps.workflow_status.outputs.has_system_error == 'true'
+      id: extract_reason
+      continue-on-error: true
+      run: |
+        if [ -f "./logs/automation.log" ]; then
+          # 로그인 실패 확인
+          if grep -q "❌ 로그인 실패로 자동화 중단" ./logs/automation.log; then
+            echo "failure_type=🔐 로그인 실패" >> $GITHUB_OUTPUT
+            login_url=$(grep "로그인 후 URL:" ./logs/automation.log | tail -1 | sed 's/🔗 로그인 후 URL: //' || echo "URL 확인 불가")
+            echo "failure_details=${login_url}" >> $GITHUB_OUTPUT
+          # 매물번호 없음
+          elif grep -q "❌ 처리할 매물번호가 없습니다" ./logs/automation.log; then
+            echo "failure_type=📋 매물번호 없음" >> $GITHUB_OUTPUT
+            echo "failure_details=환경변수에 매물번호가 설정되지 않음" >> $GITHUB_OUTPUT
+          # 기타 Python 오류
+          elif grep -q "❌ 자동화 실행 실패:" ./logs/automation.log; then
+            error_msg=$(grep "❌ 자동화 실행 실패:" ./logs/automation.log | tail -1 | sed 's/❌ 자동화 실행 실패: //')
+            echo "failure_type=⚠️ Python 스크립트 오류" >> $GITHUB_OUTPUT
+            echo "failure_details=${error_msg}" >> $GITHUB_OUTPUT
+          else
+            echo "failure_type=❓ 알 수 없는 오류" >> $GITHUB_OUTPUT
+            echo "failure_details=로그에서 오류 원인을 찾을 수 없음" >> $GITHUB_OUTPUT
+          fi
+        else
+          echo "failure_type=📁 로그 파일 없음" >> $GITHUB_OUTPUT
+          echo "failure_details=automation.log 파일을 찾을 수 없음" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Send email on system error
+      if: failure() && steps.workflow_status.outputs.has_system_error == 'true'
+      uses: dawidd6/action-send-mail@v3
+      with:
+        server_address: smtp.gmail.com
+        server_port: 465
+        secure: true
+        username: ${{ secrets.NOTIFY_EMAIL }}
+        password: ${{ secrets.NOTIFY_EMAIL_PASSWORD }}
+        subject: "❌ 자동화 시스템 오류 - ${{ github.repository }}"
+        to: ${{ secrets.NOTIFY_EMAIL }}
+        from: ${{ secrets.NOTIFY_EMAIL }}
+        body: |
+          자동화 시스템 오류 발생
+          ========================
+          
+          오류 유형: ${{ steps.extract_reason.outputs.failure_type }}
+          실패 원인: ${{ steps.extract_reason.outputs.failure_details }}
+          
+          상세 로그: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
