@@ -1,0 +1,10 @@
+{
+    "created_at": "2026-05-27 15:32:18",
+    "scheduled_for": "다음날 자정 1분 (KST)",
+    "total_count": 2,
+    "properties": [
+        "123",
+        "456"
+    ],
+    "status": "pending"
+}
