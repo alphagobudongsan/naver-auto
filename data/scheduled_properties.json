@@ -1,10 +1,7 @@
 {
-    "created_at": "2026-05-27 15:32:18",
+    "created_at": "2026-05-27 15:47:56",
     "scheduled_for": "다음날 자정 1분 (KST)",
-    "total_count": 2,
-    "properties": [
-        "123",
-        "456"
-    ],
+    "total_count": 8,
+    "properties": "즉시실행 트리거",
     "status": "pending"
 }
